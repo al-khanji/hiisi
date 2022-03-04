@@ -1,2 +1,2 @@
-(defpackage #:hiisi/x86-64
+(defpackage #:hiisi/x86
   (:use :cl))

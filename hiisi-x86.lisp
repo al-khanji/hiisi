@@ -1,411 +1,468 @@
-(in-package #:hiisi/x86-64)
+(in-package #:hiisi/x86)
 
-(defparameter *assembler-output* nil)
+(define-condition bad-line (error)
+  ((filename :initarg :filename
+             :initform nil
+             :reader filename)
+   (line-number :initarg :line-number
+                :initform nil
+                :reader line-number)
+   (line :initarg :line
+         :initform nil
+         :reader line))
+  (:documentation "Encountered a malformed line in a file")
+  (:report (lambda (condition stream)
+             (format stream "~a:~a malformed line: ~a~&" (filename condition) (line-number condition) (line condition)))))
 
-(defmacro define-constant (name value &optional doc)
-  `(defconstant ,name (if (boundp ',name) (symbol-value ',name) ,value)
-     ,@(when doc (list doc))))
+(defstruct register
+  name
+  assembler-class
+  disassembler-classes
+  register-number
+  token-flag)
 
-(define-constant +instruction-flags+
-    '((:IGEN
-       (:|SM|                "Size match")
-       (:|SM2|               "Size match first two operands")
-       (:|SB|                "Unsized operands can't be non-byte")
-       (:|SW|                "Unsized operands can't be non-word")
-       (:|SD|                "Unsized operands can't be non-dword")
-       (:|SQ|                "Unsized operands can't be non-qword")
-       (:|SO|                "Unsized operands can't be non-oword")
-       (:|SY|                "Unsized operands can't be non-yword")
-       (:|SZ|                "Unsized operands can't be non-zword")
-       (:|SIZE|              "Unsized operands must match the bitsize")
-       (:|SX|                "Unsized operands not allowed")
-       (:|ANYSIZE|           "Ignore operand size even if explicit")
-       (:|AR0|               "SB SW SD applies to argument 0")
-       (:|AR1|               "SB SW SD applies to argument 1")
-       (:|AR2|               "SB SW SD applies to argument 2")
-       (:|AR3|               "SB SW SD applies to argument 3")
-       (:|AR4|               "SB SW SD applies to argument 4")
-       (:|OPT|               "Optimizing assembly only"))
-      (:FEATURE
-       (:|PRIV|              "Privileged instruction")
-       (:|SMM|               "Only valid in SMM")
-       (:|PROT|              "Protected mode only")
-       (:|LOCK|              "Lockable if operand 0 is memory")
-       (:|NOLONG|            "Not available in long mode")
-       (:|LONG|              "Long mode")
-       (:|NOHLE|             "HLE prefixes forbidden")
-       (:|MIB|               "split base/index EA")
-       (:|SIB|               "SIB encoding required")
-       (:|BND|               "BND (0xF2) prefix available")
-       (:|UNDOC|             "Undocumented")
-       (:|HLE|               "HLE prefixed")
-       (:|FPU|               "FPU")
-       (:|MMX|               "MMX")
-       (:|3DNOW|             "3DNow!")
-       (:|SSE|               "SSE (KNI MMX2)")
-       (:|SSE2|              "SSE2")
-       (:|SSE3|              "SSE3 (PNI)")
-       (:|VMX|               "VMX")
-       (:|SSSE3|             "SSSE3")
-       (:|SSE4A|             "AMD SSE4a")
-       (:|SSE41|             "SSE4.1")
-       (:|SSE42|             "SSE4.2")
-       (:|SSE5|              "SSE5")
-       (:|AVX|               "AVX  (256-bit floating point)")
-       (:|AVX2|              "AVX2 (256-bit integer)")
-       (:|FMA|               "")
-       (:|BMI1|              "")
-       (:|BMI2|              "")
-       (:|TBM|               "")
-       (:|RTM|               "")
-       (:|INVPCID|           "")
-       (:|AVX512|            "AVX-512F (512-bit base architecture)")
-       (:|AVX512CD|          "AVX-512 Conflict Detection")
-       (:|AVX512ER|          "AVX-512 Exponential and Reciprocal")
-       (:|AVX512PF|          "AVX-512 Prefetch")
-       (:|MPX|               "MPX")
-       (:|SHA|               "SHA")
-       (:|PREFETCHWT1|       "PREFETCHWT1")
-       (:|AVX512VL|          "AVX-512 Vector Length Orthogonality")
-       (:|AVX512DQ|          "AVX-512 Dword and Qword")
-       (:|AVX512BW|          "AVX-512 Byte and Word")
-       (:|AVX512IFMA|        "AVX-512 IFMA instructions")
-       (:|AVX512VBMI|        "AVX-512 VBMI instructions")
-       (:|AES|               "AES instructions")
-       (:|VAES|              "AES AVX instructions")
-       (:|VPCLMULQDQ|        "AVX Carryless Multiplication")
-       (:|GFNI|              "Galois Field instructions")
-       (:|AVX512VBMI2|       "AVX-512 VBMI2 instructions")
-       (:|AVX512VNNI|        "AVX-512 VNNI instructions")
-       (:|AVX512BITALG|      "AVX-512 Bit Algorithm instructions")
-       (:|AVX512VPOPCNTDQ|   "AVX-512 VPOPCNTD/VPOPCNTQ")
-       (:|AVX5124FMAPS|      "AVX-512 4-iteration multiply-add")
-       (:|AVX5124VNNIW|      "AVX-512 4-iteration dot product")
-       (:|SGX|               "Intel Software Guard Extensions (SGX)")
-       (:|CET|               "Intel Control-Flow Enforcement Technology (CET)")
-       (:|ENQCMD|            "Enqueue command instructions")
-       (:|PCONFIG|           "Platform configuration instruction")
-       (:|WBNOINVD|          "Writeback and do not invalidate instruction")
-       (:|TSXLDTRK|          "TSX suspend load address tracking")
-       (:|SERIALIZE|         "SERIALIZE instruction")
-       (:|AVX512BF16|        "AVX-512 bfloat16")
-       (:|AVX512VP2INTERSECT| "AVX-512 VP2INTERSECT instructions")
-       (:|AMXTILE|           "AMX tile configuration instructions")
-       (:|AMXBF16|           "AMX bfloat16 multiplication")
-       (:|AMXINT8|           "AMX 8-bit integer multiplication")
-       (:|OBSOLETE|          "Instruction removed from architecture")
-       (:|NEVER|             "Instruction never implemented")
-       (:|NOP|               "Instruction is always a (nonintentional) NOP")
-       (:|VEX|               "VEX or XOP encoded instruction")
-       (:|EVEX|              "EVEX encoded instruction"))
-      (:CPU
-       (:|8086|              "8086")
-       (:|186|               "186+")
-       (:|286|               "286+")
-       (:|386|               "386+")
-       (:|486|               "486+")
-       (:|PENT|              "Pentium")
-       (:|P6|                "P6")
-       (:|KATMAI|            "Katmai")
-       (:|WILLAMETTE|        "Willamette")
-       (:|PRESCOTT|          "Prescott")
-       (:|X86_64|            "x86-64 (long or legacy mode)")
-       (:|NEHALEM|           "Nehalem")
-       (:|WESTMERE|          "Westmere")
-       (:|SANDYBRIDGE|       "Sandy Bridge")
-       (:|FUTURE|            "Ivy Bridge or newer")
-       (:|IA64|              "IA64 (in x86 mode)")
-       (:|ANY|               "Any x86 CPU")
-       (:|CYRIX|             "Cyrix-specific")
-       (:|AMD|               "AMD-specific"))))
+(defparameter *registers* nil
+  "Known registers")
 
-(define-constant +bit-sizes+
-    '((:byte 8)
-      (:word 16)
-      (:dword 32)
-      (:qword 64)
-      (:tword 80)
-      (:oword 128)
-      (:yword 256)
-      (:zword 512)))
+(defparameter *register-assembler-classes*
+  '(BNDREG
+    FPU0
+    FPUREG
+    MMXREG
+    OPMASK0
+    OPMASKREG
+    REG16NA
+    REG32NA
+    REG64NA
+    REG8NA
+    REG_AL
+    REG_AX
+    REG_CL
+    REG_CREG
+    REG_CS
+    REG_CX
+    REG_DL
+    REG_DREG
+    REG_DS
+    REG_DX
+    REG_EAX
+    REG_ECX
+    REG_EDX
+    REG_ES
+    REG_FS
+    REG_GS
+    REG_HIGH
+    REG_RAX
+    REG_RCX
+    REG_RDX
+    REG_SEG67
+    REG_SS
+    REG_TREG
+    TMMREG
+    XMM0
+    XMMREG
+    XMM_L16
+    YMM0
+    YMMREG
+    YMM_L16
+    ZMM0
+    ZMMREG
+    ZMM_L16))
 
-(define-constant +legacy-prefixes+
-    '((#x66)
-      (#x67)
-      (#x2E :cS)
-      (#x3E :ds)
-      (#x26 :es)
-      (#x64 :fs)
-      (#x65 :gs)
-      (#x36 :ss)
-      (#xF0 :lock)
-      (#xF3 :rep :repe :repz)
-      (#xF2 :repne :repnz)))
+(defun add-register (name assembler-class disassembler-classes register-number token-flag)
+  "Add a new register to *REGISTERS*."
+  (push (make-register :name name
+                       :assembler-class assembler-class
+                       :disassembler-classes disassembler-classes
+                       :register-number register-number
+                       :token-flag token-flag)
+        *registers*))
 
-(define-constant +rex+ #b01000000)
-(define-constant +rex.w+ (logior +rex+ #b1000))
-(define-constant +rex.r+ (logior +rex+ #b0100))
-(define-constant +rex.x+ (logior +rex+ #b0010))
-(define-constant +rex.b+ (logior +rex+ #b0001))
+(defun register-names (reg)
+  "Given a name like \"r8-15d\" expands it into a list of names."
+  (multiple-value-bind (match strings)
+      (cl-ppcre:scan-to-strings "^(.*[^0-9])([0-9]+)\\-([0-9]+)(|[^0-9].*)$" reg)
+    (unless match
+      (return-from register-names (list reg)))
+    (let ((prefix (aref strings 0))
+          (suffix (aref strings 3))
+          (nregs (1+ (- (parse-integer (aref strings 2))
+                        (parse-integer (aref strings 1))))))
+      (loop repeat nregs
+            for reg-number from (parse-integer (aref strings 1))
+            collect (format nil "~a~a~a" prefix reg-number suffix)))))
 
-(defun generate-prefixes (&optional (static-prefixes '("0F24" "0F25" "0F38" "0F3A" "0F7A" "0FA6" "0FA7" "0F"))
-                                    (prefixes '("vex" "xop" "evex"))
-                                    (m-count 32)
-                                    (p-count 4))
-  (let (output)
-    (dolist (prefix prefixes)
-      (dotimes (m m-count)
-        (dotimes (p p-count)
-          (push (format nil "~A~2,'0X~1,'0X" prefix m p) output))))
-    (append static-prefixes (nreverse output))))
+(defun process-regs.dat-line (line-number reg aclass dclasses x86regno &optional token-flag)
+  "Process a single data line from regs.dat. Insert results into *REGISTERS*."
+  (declare (ignore line-number))
+  (let ((aclass (read-from-string aclass))
+        (dclasses (mapcar #'read-from-string (cl-ppcre:split "," dclasses)))
+        (x86regno (parse-integer x86regno :radix (if (cl-ppcre:scan "^0" x86regno)
+                                                     8
+                                                     10)))
+        (token-flag (read-from-string token-flag nil nil)))
+    (loop for reg in (register-names reg)
+          for num from x86regno
+          do (add-register (read-from-string reg) aclass dclasses num token-flag))))
 
-(defun legacy-prefix-p (x)
-  (find x +legacy-prefixes+ :key #'car))
+(defun slurp-lines (filename &key (filter (constantly nil)))
+  "Read lines from FILENAME and return a list of `(line-number line-text)'. A per-line :filter
+may be supplied, given the line as input return non-NIL to skip it."
+  (with-open-file (f filename)
+    (loop for n from 1
+          for line = (read-line f nil nil)
+          while line
+          unless (funcall filter line)
+            collect (list n line))))
 
-(defun rex-prefix-p (x)
-  (when (= +rex+ (logand +rex+ x))
-    x))
+(defun process-regs.dat (filename)
+  "Read register info from regs.dat found at FILENAME and insert into *REGISTERS*."
+  (loop for (line-number line)
+          in (slurp-lines filename
+                          :filter (lambda (line)
+                                    ; skip comments or blank lines
+                                    (string= "" (cl-ppcre:regex-replace "\\s*(\\#.*|)$" line ""))))
+        with scanner
+          = (cl-ppcre:create-scanner "\\s*(\\S+)\\s*(\\S+)\\s*(\\S+)\\s*([0-9]+)\\s*(\\S*)"
+                                     :case-insensitive-mode t)
+        do (multiple-value-bind (match strings) (cl-ppcre:scan-to-strings scanner line)
+             (unless match
+               (error 'bad-line :filename filename :line-number line-number :line line))
+             (apply #'process-regs.dat-line line-number (coerce strings 'list)))))
 
-(define-constant +imm-codes+
-    '("ib"
-      "ib,u"
-      "iw"
-      "ib,s"
-      "iwd"
-      "id"
-      "id,s"
-      "iwdq"
-      "rel8"
-      "iq"
-      "rel16"
-      "rel"
-      "rel32"
-      "seg"))
+(defparameter +max-operands+ 5)
 
-(define-constant +plain-codes+
-    '("o16"
-      "o32"
-      "odf"
-      "o64"
-      "o64nw"
-      "a16"
-      "a32"
-      "adf"
-      "a64"
-      "!osp"
-      "!asp"
-      "f2i"
-      "f3i"
-      "mustrep"
-      "mustrepne"
-      "rex.l"
-      "norexb"
-      "norexx"
-      "norexr"
-      "norexw"
-      "repe"
-      "nohi"
-      "nof3"
-      "norep"
-      "wait"
-      "resb"
-      "np"
-      "jcc8"
-      "jmp8"
-      "jlen"
-      "hlexr"
-      "hlenl"
-      "hle"
-      "vsibx"
-      "vm32x"
-      "vm64x"
-      "vsiby"
-      "vm32y"
-      "vm64y"
-      "vsibz"
-      "vm32z"
-      "vm64z"))
+(defparameter *instructions* nil)
+
+(defstruct instruction
+  name
+  operands
+  code
+  flags)
+
+(defun instruction-forms (name operands code flags)
+  (flet ((relaxed-op-p (op) (cl-ppcre:scan "\\*$" op)))
+    (let* ((ops (cl-ppcre:split "," operands))
+           (n-ops (length ops))
+           (has-relaxed-forms (some #'relaxed-op-p ops))
+;           (name (intern name))
+           (flags (mapcar #'intern (cl-ppcre:split "," flags))))
+      (append (list (list name (join-strings "," ops) code flags 0))
+              (when has-relaxed-forms
+                (when (relaxed-op-p (first ops))
+                  (error "instruction ~A has first operand with a *" name))
+                (loop with opmask = (apply #'logior (loop for n from 0
+                                                          for op in ops
+                                                          when (relaxed-op-p op)
+                                                            collect (ash 1 n)))
+                      for oi from 1 below (ash 1 n-ops)
+                      when (zerop (logandc2 oi opmask))
+                        collect (list name
+                                      (join-strings ","
+                                                    (loop for op in ops
+                                                          for omask = (lognot oi) then (ash omask -1)
+                                                          unless (zerop (logand omask 1))
+                                                            collect op))
+                                      code
+                                      flags
+                                      oi)))))))
+
+(defun join-strings (delimiter strings)
+  (let ((format-string (format nil "~~{~~A~~^~A~~}" delimiter)))
+    (format nil format-string strings)))
+
+(defun do-replacements (target-string replacements &key (replace-all t))
+  (let ((fn (if replace-all
+                #'cl-ppcre:regex-replace-all
+                #'cl-ppcre:regex-replace)))
+    (loop for (regex replacement) in replacements
+          do (setf target-string (funcall fn regex target-string replacement)))
+    target-string))
+
+(defun format-operand (operand evex-p)
+  (let (opsz opx opevex)
+    (dolist (opp (cl-ppcre:split "\\|" operand))
+      (setf opp (cl-ppcre:regex-replace "^(b(32|64)|mask|z|er|sae)$"
+                                        opp
+                                        #'(lambda (match reg0 &rest remaining-registers)
+                                            (declare (ignore match remaining-registers))
+                                            (push reg0 opevex)
+                                            "")
+                                        :simple-calls t))
+      (setf opp (cl-ppcre:regex-replace "(?<!\\d)(8|16|32|64|80|128|256|512)$"
+                                        opp
+                                        #'(lambda (match reg0 &rest remaining-registers)
+                                            (declare (ignore match remaining-registers))
+                                            (setf opsz (parse-integer reg0 :radix 10))
+                                            "")
+                                        :simple-calls t))
+      (setf opp (do-replacements opp (append '(("^mem$" "memory")
+                                               ("^memory_offs$" "mem_offs")
+                                               ("^imm$" "immediate")
+                                               ("^([a-z]+)rm$" "rm_\\{1}")
+                                               ("^rm$" "rm_gpr")
+                                               ("^reg" "reg_gpr"))
+                                             (unless evex-p
+                                               '(("^(rm_[xyz]mm)$" "\\{1}_l16")
+                                                 ("^([xyz]mm)reg$" "\\{1}_l16"))))))
+      (unless (string= opp "")
+        (push opp opx)))
+    (flet ((symbolicate (list) (reverse (mapcar #'read-from-string list))))
+      (list :opx (symbolicate opx)
+            :opsz opsz
+            :opevex (symbolicate opevex)))))
+
+(defparameter *imm-codes*
+  '("ib"
+    "ib,u"
+    "iw"
+    "ib,s"
+    "iwd"
+    "id"
+    "id,s"
+    "iwdq"
+    "rel8"
+    "iq"
+    "rel16"
+    "rel"
+    "rel32"
+    "seg"))
+
+(defparameter *plain-codes*
+  '("o16"
+    "o32"
+    "odf"
+    "o64"
+    "o64nw"
+    "a16"
+    "a32"
+    "adf"
+    "a64"
+    "!osp"
+    "!asp"
+    "f2i"
+    "f3i"
+    "mustrep"
+    "mustrepne"
+    "rex.l"
+    "norexb"
+    "norexx"
+    "norexr"
+    "norexw"
+    "repe"
+    "nohi"
+    "nof3"
+    "norep"
+    "wait"
+    "resb"
+    "np"
+    "jcc8"
+    "jmp8"
+    "jlen"
+    "hlexr"
+    "hlenl"
+    "hle"
+    "vsibx"
+    "vm32x"
+    "vm64x"
+    "vsiby"
+    "vm32y"
+    "vm64y"
+    "vsibz"
+    "vm32z"
+    "vm64z"))
+
+(defun imm-code-p (op)
+  (member op *imm-codes*))
 
 (defun plain-code-p (op)
-  (find op +plain-codes+ :test #'string=))
+  (member op *plain-codes*))
 
-(defun encoding->code (codestr)
-  (cl-ppcre:register-groups-bind (dummy opr tuple opc)
-      ("^(([^\\s:]*)\\:*([^\\s:]*)\\:|)\\s*(.*\\S)\\s*$" codestr)
-    (declare (ignore dummy))
-    (let* ((oppos (loop with op = 0
-                        for c across (or opr #())
-                        for plusp = (char= #\+ c)
-                        unless plusp collect (cons c op)
-                        if plusp do (decf op)
-                        else do (incf op)))
-           (ops (cl-ppcre:split "\\s*(?:\\s|(?=[\\/\\\\]))" opc))
-           (last-imm "h")
-           (prefix-ok t)
-           code
-           last-match-regs)
-      (dolist (op ops)
-        (cond ((plain-code-p op)
-               (push op code))
-              ((and prefix-ok (find op '("66" "f2" "f3") :test #'string=))
-               (push op code))
-              ((cl-ppcre:scan "^[0-9a-f]{2}$" op)
-               (push op code))
-              ((string= op "/r")
-               (let* ((r-pos (cdr (assoc #\r oppos)))
-                      (m-pos (cdr (assoc #\m oppos)))
-                      (opex (logior (if (logand r-pos 4) 5 0)
-                                    (if (logand m-pos 4) 6 0))))
-                 (unless (and r-pos m-pos)
-                   (error (concatenate 'string codestr ": /r requires r and m operands")))
-                 (when (/= opex 0)
-                   (push (list :opex opex) code))
-                 (push (list :modrm
-                             100
-                             (list m-pos (logand m-pos 3))
-                             (list r-pos (logand r-pos 3)))
-                       code)
-                 (setf prefix-ok nil)))
-              ((multiple-value-bind (match regs) (cl-ppcre:scan-to-strings "^/([0-7])$" op)
-                 (setf last-match-regs regs)
-                 match)
-               (let ((m-pos (cdr (assoc #\m oppos))))
-                 (unless m-pos
-                   (error (concatenate 'string codestr ": " op "requires an m operand")))
-                 (when (logand m-pos 4)
-                   (push (list :opex #o6) code))
-                 (push `(:modrm 200
-                                ,m-pos
-                                ,last-match-regs)
-                       code)))
-              (t
-               (push (list :fallback op) code))))
-      (list oppos tuple ops (nreverse code)))))
+(defun instruction-code-parse (code)
+  (assert (cl-ppcre:scan "^\\s*\\[([^\\]]*)\\]\\s*$" code))
+  (multiple-value-bind (match fields) (cl-ppcre:scan-to-strings "^(([^\\s:]*)\\:*([^\\s:]*)\\:|)\\s*(.*\\S)\\s*$"
+                                                                (subseq code 1 (1- (length code))))
+    (unless match
+      (error "Can't parse ~A" code))
+    (mapcar #'string-downcase (coerce (subseq fields 1 4) 'list))))
 
-(defun encoding->assembler (encoding)
-  (when (string= encoding "ignore")
-    (return-from encoding->assembler nil))
-  (cl-ppcre:register-groups-bind (first)
-      ("^\\s*\\[([^\\]]*)\\]\\s*$" encoding)
-    (return-from encoding->assembler (encoding->code first)))
-  (error encoding "unknown code format"))
+(defun instruction-code-op-positions (opr relax)
+  (loop for op from 0
+        for c across opr
+        for plus-p = (char= #\+ c)
+        for relax-p = (= 1 (logand relax 1))
+        when (or plus-p relax-p)
+          do (decf op)
+        unless plus-p
+          collect (cons c op) into oppos
+          and do (setf relax (ash relax -1))
+        finally (return oppos)))
 
-(defun make-assembler (name operands encoding flags)
-  (list name operands (encoding->assembler encoding) flags))
+(defun instruction-code-compile (code relax)
+  (when (string= code "ignore")
+    (return-from instruction-code-compile))
 
-(defun frob-assembler (insns)
-  (format nil "~{~W~%~W~^~%~%~}" (loop for x in insns
-                                     for y = (apply #'make-assembler x)
-                                     collect x
-                                     collect y)))
+  (loop with (opr tuple opc) = (instruction-code-parse code)
+        with ops = (cl-ppcre:split "\\s*(?:\\s|(?=[\\/\\\\]))" opc)
+        with oppos = (instruction-code-op-positions opr relax)
+        with last-immediate = "h"
+        with prefix-ok = t
+        with litix
+        with output
+        for op in ops
+        do (cond
+             ;; plain code
+             ((plain-code-p op)
+              (push op output))
+             ;; prefix
+             ((and prefix-ok (member op '("66" "f2" "f3")))
+              (push op output))
+             ;; literal
+             ((cl-ppcre:scan "^[0-9a-f]{2}$" op)
+              (push op output)
+              (setf prefix-ok nil))
+             ;; rm
+             ((string= op "/r")
+              (let ((r-pos (cdr (assoc #\r oppos)))
+                    (m-pos (cdr (assoc #\m oppos)))
+                    (x-pos (cdr (assoc #\x oppos))))
+                (assert (and r-pos m-pos))
+                (let ((opex (logior (if (zerop (logand r-pos 4))
+                                        0
+                                        5)
+                                    (if (zerop (logand m-pos 4))
+                                        0
+                                        6))))
+                  (unless (zerop opex)
+                    (push `(opex ,opex) output)))
+                (when x-pos
+                  (push (+ #o14 (logand x-pos 3)) output))
+                (push (+ #o100 (ash (logand m-pos 3) 3)) output)
+                (setf prefix-ok nil)))
+             (t (push `(unknown ,op) output)))
+        finally (return (list oppos tuple (reverse output)))))
 
-(labels ((whitespace-p (x &optional (whitespace '(#\Space #\Tab)))
-           (find x whitespace))
-         (read-word (stream &optional (test #'whitespace-p) (skip-whitespace-p t))
-           (when skip-whitespace-p
-             (peek-char t stream))
-           (loop for c = (peek-char nil stream nil nil)
-                 while (and c (not (funcall test c)))
-                 collect (read-char stream) into chars
-                 finally (return (coerce chars 'string))))
-         (split-if (predicate sequence &key (start 0) end remove-empty-subseqs)
-           (loop with end = (or end (length sequence))
-                 for left = start then (1+ right)
-                 for right = (position-if predicate sequence :start left :end end)
-                 for subseq-end = (or right end)
-                 if (or (plusp (- subseq-end left))
-                        (not remove-empty-subseqs))
-                 collect (subseq sequence left (or right end))
-                 while right))
-         (split (needle sequence &key (start 0) end remove-empty-subseqs)
-           (split-if (lambda (c) (eql needle c))
-                     sequence
-                     :start start
-                     :end end
-                     :remove-empty-subseqs remove-empty-subseqs))
-         (make-keyword (s)
-           (intern s :keyword))
-         (make-keywords (seq)
-           (map-into seq #'make-keyword seq))
-         (split-keywords (str &optional (needle #\,))
-           (make-keywords (split needle str)))
-         (split-encoding (encoding)
-           (let ((left 0)
-                 (right (1- (length encoding))))
-             (if (and (char= #\[ (elt encoding left))
-                      (char= #\] (elt encoding right)))
-                 (split-if #'whitespace-p
-                           encoding
-                           :start (1+ left)
-                           :end right
-                           :remove-empty-subseqs t)
-                 encoding)))
-         (parse-operand (operand)
-           ((lambda (x)
-              (if (cdr x) x (car x)))
-            (split-keywords operand #\|)))
-         (split-operands (operands)
-           (mapcar #'parse-operand
-                   (split #\, operands)))
-         (explode-reg-names (name)
-           (let ((dash-pos (position #\- name)))
-             (if dash-pos
-                 (loop with first-digit-pos = (position-if #'digit-char-p name)
-                       with last-digit-pos = (position-if #'digit-char-p name :from-end t)
-                       with prefix =(subseq name 0 first-digit-pos)
-                       with suffix = (subseq name (1+ last-digit-pos))
-                       with start-number = (read-from-string name t nil
-                                                             :start first-digit-pos
-                                                             :end dash-pos)
-                       with end-number = (read-from-string name t nil
-                                                           :start (1+ dash-pos)
-                                                           :end (1+ last-digit-pos))
-                       for i from start-number to end-number
-                       collect (format nil "~A~A~A" prefix i suffix))
-                 (list name))))
-         (skip-line-p (line comment-char)
-           (with-input-from-string (in line)
-             (char= comment-char (peek-char t in nil comment-char))))
-         (parse-reg-line (line)
-           (with-input-from-string (in (string-upcase line))
-             (let* ((name (read-word in))
-                    (assembler-class (read-word in))
-                    (disassembler-classes (read-word in))
-                    (register-number (read in)))
-               (loop for name in (explode-reg-names name)
-                     for num from register-number
-                     collect (list (make-keyword name)
-                                   (make-keyword assembler-class)
-                                   (split-keywords disassembler-classes)
-                                   num)))))
-         (parse-insn-line (line)
-           (with-input-from-string (in line)
-             (let* ((name (read-word in))
-                    (operands (read-word in))
-                    (encoding (case (peek-char t in)
-                                (#\[ (read-word in
-                                                (let (previous-char)
-                                                  (lambda (current-char)
-                                                    (prog1 (eql previous-char #\])
-                                                      (setf previous-char current-char))))))
-                                (t (read-word in))))
-                    (flags (read-word in)))
-               (list (make-keyword name)
-                     (unless (or (string= "ignore" operands)
-                                 (string= "void" operands))
-                       (split-operands (string-upcase operands)))
-                     encoding
-                     (unless (string= "ignore" flags)
-                       (split-keywords flags)))))))
-  (defun slurp-regs (filepath)
-    (with-open-file (in filepath)
-      (loop for line = (read-line in nil nil)
-            while line
-            unless (skip-line-p line #\#)
-            append (parse-reg-line line))))
-  (defun slurp-insns (filepath)
-    (with-open-file (in filepath)
-      (loop for line = (read-line in nil nil)
-            while line
-            unless (skip-line-p line #\;)
-            collect (parse-insn-line line)))))
+
+(defun process-instruction (name operands code flags relax)
+  (let* ((evex-p (cl-ppcre:scan "(^|\\s)evex\\." code))
+         (ops (unless (string= operands "void")
+                (loop for operand in (cl-ppcre:split "\\," (do-replacements operands '(("\\*" "")
+                                                                                       (":" "|colon,"))))
+                      collect (format-operand operand evex-p)))))
+    (when (null ops)
+      (assert (zerop relax)))
+    (push (make-instruction :name name
+                            :operands ops
+                            :code code
+                            :flags (append flags
+                                           (unless (zerop relax)
+                                             `((relax ,relax)))))
+          *instructions*)))
+
+(defun process-insns.dat-line (line-number name operands code flags)
+  (declare (ignore line-number))
+  (loop for (name ops code flags relax) in (instruction-forms name operands code flags)
+        do (process-instruction name ops code flags relax)))
+
+(defun process-insns.dat (filename)
+  (loop for (line-number line)
+          in (slurp-lines filename
+                          :filter (lambda (line)
+                                        ; skip comments or blank lines
+                                    (string= "" (cl-ppcre:regex-replace "^\\s*(\\;.*|)$" line ""))))
+        with scanner
+          = (cl-ppcre:create-scanner "^\\s*(\\S+)\\s+(\\S+)\\s+(\\S+|\\[.*\\])\\s+(\\S+)\\s*$")
+        do (multiple-value-bind (match strings) (cl-ppcre:scan-to-strings scanner line)
+             (unless match
+               (error 'bad-line :filename filename :line-number line-number :line line))
+             (apply #'process-insns.dat-line line-number (coerce strings 'list)))))
+
+(defun %reload ()
+  (setf *registers* nil
+        *instructions* nil)
+  (process-regs.dat "~/github/netwide-assembler/nasm/x86/regs.dat")
+  (process-insns.dat "~/github/netwide-assembler/nasm/x86/insns.dat"))
+
+
+(defparameter *test-program* '((push #x1)
+                               (pop rdi)
+                               (mov rax rdi)
+                               (syscall)))
+
+(defun %find-entries (name key list)
+  (let ((needle (string-upcase (etypecase name
+                                 (symbol (symbol-name name))
+                                 (string name)))))
+    (remove-if-not (lambda (i)
+                     (string= needle (string-upcase (string (funcall key i)))))
+                   list)))
+
+(defun %find-instructions (name)
+  (%find-entries name #'instruction-name *instructions*))
+
+(defun %find-registers (name)
+  (%find-entries name #'register-name *registers*))
+
+(defclass value-type ()
+  ((value :accessor value :initarg :value :type integer :initform (error "Must supply value"))))
+
+(defclass immediate (value-type)
+  ((width :accessor width :initarg :width :type integer :initform (error "Must supply width"))))
+
+(defgeneric make-value-type (value)
+  (:documentation "Create a value type for value"))
+
+(defun imm-width (integer)
+  (loop repeat 5
+        with width = (integer-length integer)
+        for imm-width from 8 by 8
+        while (<= imm-width width)
+        finally (return imm-width)))
+
+(defmethod make-value-type ((n integer))
+  (make-instance 'immediate :value n :width (imm-width n)))
+
+(defgeneric %operand-and-value-type-compatible-p (operand value-type))
+
+(defmethod %operand-and-value-type-compatible-p (operand value-type)
+  (declare (ignore operand value-type))
+  nil)
+
+(defmethod %operand-and-value-type-compatible-p ((o string) (imm immediate))
+  (multiple-value-bind (match fields) (cl-ppcre:scan-to-strings "imm([0-9]{1,2})" o)
+    (when match
+      (>= (parse-integer (aref fields 0)) (width imm)))))
+
+(defmethod %operand-and-value-type-compatible-p ((o string) (reg (eql 'eax)))
+  (let ((registers (%find-registers reg)))
+    (when (= 1 (length registers))
+      )
+    (unless (rest registers)
+      ))
+  (format t "EAX BABY~%")
+  t)
+
+(defun %operand-and-parameter-compatible-p (o p)
+  (%operand-and-value-type-compatible-p o (make-value-type p)))
+
+(defun %instruction-and-parameters-compatible-p (instruction parameters)
+  (let ((operands (instruction-operands instruction)))
+    (when (= (length operands) (length parameters))
+      (mapcar (lambda (operand parameter)
+                (unless (%operand-and-parameter-compatible-p operand parameter)
+                  (return-from %instruction-and-parameters-compatible-p)))
+              operands parameters)
+      t)))
+
+(defun %compile-form (form)
+  (loop with operation = (first form)
+        with parameters = (rest form)
+        for instruction in (%find-instructions operation)
+        if (%instruction-and-parameters-compatible-p instruction parameters)
+          collect instruction))
+
+(defun %compile (forms)
+  (loop for form in forms
+        collect (list :input form :output (%compile-form form))))
+
+(%reload)
